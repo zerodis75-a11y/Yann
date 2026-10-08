@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<!--
+SETUP (Supabase): 1) Create a project. 2) Authentication > Providers: enable Email. 3) SQL Editor: run the block below once.
+4) Project Settings > API: copy the Project URL and anon public key into SUPABASE_URL and SUPABASE_ANON_KEY near the end of this file.
+5) Authentication > URL Configuration: add the address where you host this file as a Site URL / Redirect URL.
+Never put the service_role key in this file.
+
+create extension if not exists pgcrypto with schema extensions;
+create table profiles(
+ id uuid primary key references auth.users on delete cascade,
+ name text not null, code text unique not null, ref_by text,
+ points int not null default 0 check(points>=0), spent int not null default 0,
+ streak int not null default 0, last_check date, last_spin date,
+ pin_hash text, has_pin boolean not null default false,
+ created_at timestamptz not null default now());
+create table ledger(id bigserial primary key, user_id uuid not null references profiles on delete cascade, note text not null, pts int not null, created_at timestamptz not null default now());
+create table cashouts(id bigserial primary key, user_id uuid not null references profiles, phone text not null, pts int not null, status text not null default 'pending', created_at timestamptz not null default now());
+alter table profiles enable row level security;
+alter table ledger enable row level security;
+alter table cashouts enable row level security;
+create policy own_profile on profiles for select using (auth.uid()=id);
+create policy own_ledger on ledger for select using (auth.uid()=user_id);
+create policy own_cashouts on cashouts for select using (auth.uid()=user_id);
+revoke all on profiles, ledger, cashouts from anon, authenticated;
+grant select(name,code,points,spent,streak,last_check,last_spin,has_pin) on profiles to authenticated;
+grant select on ledger, cashouts to authenticated;
+
+create function handle_new_user() returns trigger language plpgsql security definer set search_path=public as $f$
+declare c text; nm text:=coalesce(nullif(trim(new.raw_user_meta_data->>'name'),''),'Member');
+begin
+ c:=upper(left(regexp_replace(nm,'[^a-zA-Z]','','g'),4)); if c='' then c:='KWIK'; end if;
+ c:=c||'-'||upper(substr(md5(random()::text),1,3));
+ insert into profiles(id,name,code,ref_by,points) values(new.id,nm,c,nullif(upper(trim(new.raw_user_meta_data->>'ref')),''),100);
+ insert into ledger(user_id,note,pts) values(new.id,'Welcome bonus',100);
+ return new;
+end $f$;
+create trigger on_signup after insert on auth.users for each row execute function handle_new_user();
+
+create function check_in() returns jsonb language plpgsql security definer set search_path=public as $f$
+declare p profiles; n int; v int;
+begin
+ select * into p from profiles where id=auth.uid() for update;
+ if p.last_check=current_date then raise exception 'You already checked in today'; end if;
+ n:=case when p.last_check=current_date-1 and p.streak<7 then p.streak+1 else 1 end;
+ v:=case when n=7 then 150 else 10 end;
+ update profiles set streak=n,last_check=current_date,points=points+v where id=p.id;
+ insert into ledger(user_id,note,pts) values(p.id,'Daily check-in (day '||n||')',v);
+ return jsonb_build_object('streak',n,'pts',v);
+end $f$;
+
+create function spin() returns jsonb language plpgsql security definer set search_path=public as $f$
+declare p profiles; i int:=floor(random()*6)::int;
+ labels text[]:=array['50 pts','100 pts','Try again','Free delivery code FREEDEL','200 pts','5% off code SAVE5'];
+ prizes int[]:=array[50,100,0,0,200,0];
+begin
+ select * into p from profiles where id=auth.uid() for update;
+ if p.last_spin=current_date then raise exception 'You already spun today'; end if;
+ update profiles set last_spin=current_date,points=points+prizes[i+1] where id=p.id;
+ insert into ledger(user_id,note,pts) values(p.id,'Daily spin: '||labels[i+1],prizes[i+1]);
+ return jsonb_build_object('i',i,'label',labels[i+1],'pts',prizes[i+1]);
+end $f$;
+
+create function redeem_credit(p_n int) returns void language plpgsql security definer set search_path=public as $f$
+declare p profiles;
+begin
+ select * into p from profiles where id=auth.uid() for update;
+ if p_n<100 then raise exception 'Use at least 100 points'; end if;
+ if p_n>p.points then raise exception 'Not enough points'; end if;
+ update profiles set points=points-p_n where id=p.id;
+ insert into ledger(user_id,note,pts) values(p.id,'Store credit applied',-p_n);
+end $f$;
+
+create function set_pin(p_pin text) returns void language plpgsql security definer set search_path=public as $f$
+begin
+ if p_pin !~ '^[0-9]{4}$' then raise exception 'PIN must be 4 digits'; end if;
+ update profiles set pin_hash=extensions.crypt(p_pin,extensions.gen_salt('bf')),has_pin=true where id=auth.uid();
+end $f$;
+
+create function request_cashout(p_phone text,p_pin text,p_n int) returns void language plpgsql security definer set search_path=public as $f$
+declare p profiles;
+begin
+ select * into p from profiles where id=auth.uid() for update;
+ if not p.has_pin then raise exception 'Set a withdrawal PIN first'; end if;
+ if p.pin_hash<>extensions.crypt(p_pin,p.pin_hash) then raise exception 'Wrong PIN'; end if;
+ if p_phone !~ '^6[0-9]{8}$' then raise exception 'Enter a valid 9-digit number starting with 6'; end if;
+ if p_n<2000 then raise exception 'Minimum cash out is 2,000 points'; end if;
+ if p_n>p.points then raise exception 'Not enough points'; end if;
+ update profiles set points=points-p_n where id=p.id;
+ insert into cashouts(user_id,phone,pts) values(p.id,p_phone,p_n);
+ insert into ledger(user_id,note,pts) values(p.id,'Cash out to '||p_phone,-p_n);
+end $f$;
+
+create function my_referrals() returns table(name text, ordered boolean) language sql security definer set search_path=public as $f$
+ select name, spent>0 from profiles where ref_by=(select code from profiles where id=auth.uid())
+$f$;
+
+revoke execute on all functions in schema public from public, anon;
+grant execute on function check_in(), spin(), redeem_credit(int), set_pin(text), request_cashout(text,text,int), my_referrals() to authenticated;
+
+Order system (your Node/Express server, using the service_role key, never in the browser): when an order is delivered, add to profiles.spent and points, insert a ledger row, and pay the 100-point referral bonus. Pay pending rows in cashouts via Flutterwave from the server, then set status to 'paid'.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kwik Rewards</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=DM+Sans:wght@400;500;700&display=swap">
+<style>
+:root{--bg:#f2f5f2;--panel:#fff;--ink:#14231c;--mute:#5d6f66;--line:#dbe3dd;--g:#0f6b3a;--y:#f2b705;--r:#c8372d;--on-g:#fff;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1a14;--panel:#17251d;--ink:#e8f0ea;--mute:#9bb0a3;--line:#294136;--g:#3fbf7a;--on-g:#07130d}}
+:root[data-theme="dark"]{--bg:#0f1a14;--panel:#17251d;--ink:#e8f0ea;--mute:#9bb0a3;--line:#294136;--g:#3fbf7a;--on-g:#07130d}
+*{box-sizing:border-box}html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 "DM Sans",system-ui,sans-serif}
+h1,h2,h3{font-family:"Bricolage Grotesque",system-ui,sans-serif;margin:0;letter-spacing:-.01em}
+button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:10px 16px;background:var(--g);color:var(--on-g);font-weight:700}
+button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.45;cursor:not-allowed}
+:focus-visible{outline:3px solid var(--y);outline-offset:2px}
+input{font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);width:100%}
+.app{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+nav{background:var(--panel);border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh}
+nav .brand{font:700 22px "Bricolage Grotesque";padding:4px 10px 18px}nav .brand i{color:var(--y);font-style:normal}
+nav button{display:block;width:100%;text-align:left;background:none;color:var(--mute);margin-bottom:4px}
+nav button.on{background:var(--bg);color:var(--ink);box-shadow:inset 3px 0 var(--g)}
+main{padding:24px;max-width:960px;width:100%}
+.top{display:flex;justify-content:space-between;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.top p{margin:2px 0 0;color:var(--mute)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.hero{background:var(--g);color:var(--on-g);border:0;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.hero .big{font:700 44px/1 "Bricolage Grotesque"}.hero small{opacity:.85}
+.hero button{background:var(--y);color:#2b2200}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.days{display:flex;gap:6px;margin:12px 0}
+.day{flex:1;text-align:center;padding:8px 0;border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--mute)}
+.day.done{background:var(--g);color:var(--on-g);border-color:var(--g)}
+.wheelbox{display:flex;flex-direction:column;align-items:center;gap:12px}
+.wheelwrap{position:relative;width:200px;height:200px}
+.wheel{width:100%;height:100%;border-radius:50%;border:4px solid var(--ink);transition:transform 3.2s cubic-bezier(.12,.7,.1,1);
+background:conic-gradient(#0f6b3a 0 60deg,#f2b705 60deg 120deg,#c8372d 120deg 180deg,#2e8f5c 180deg 240deg,#d99a00 240deg 300deg,#7d8f85 300deg 360deg)}
+.pin{position:absolute;top:-10px;left:50%;transform:translateX(-50%);border:10px solid transparent;border-top:18px solid var(--ink);border-bottom:0}
+.tier{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px}
+.tier.cur{border-color:var(--g);box-shadow:inset 4px 0 var(--g)}
+.tier b{font-family:"Bricolage Grotesque"}.tier span{color:var(--mute);font-size:13px;margin-left:auto;text-align:right}
+.bar{height:8px;background:var(--bg);border-radius:6px;overflow:hidden;margin:8px 0}.bar i{display:block;height:100%;background:var(--y)}
+.row{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border:0}.pos{color:var(--g);font-weight:700}.neg{color:var(--r);font-weight:700}
+.code{font:700 20px "Bricolage Grotesque";padding:10px 14px;background:var(--bg);border:1px dashed var(--mute);border-radius:10px;display:inline-block}
+.scroll{overflow-x:auto}label{display:block;font-weight:500;margin:10px 0 4px}
+.toast{position:fixed;left:50%;bottom:calc(76px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:9}
+.toast.show{opacity:1}
+.note{font-size:13px;color:var(--mute)}
+body.out .app{display:none!important}body.in #auth{display:none}
+#auth{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.authbox{width:100%;max-width:400px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px}
+.authbox .brand{font:700 28px "Bricolage Grotesque"}.authbox .brand i{color:var(--y);font-style:normal}
+.tabs{display:flex;gap:6px;margin:16px 0 4px}.tabs button{flex:1}.tabs button.on{background:var(--g);color:var(--on-g);border-color:var(--g)}
+.err{color:var(--r);font-size:13px;min-height:18px;margin:8px 0 0}
+.authbox form button[type=submit]{width:100%;margin-top:8px}
+@media(max-width:760px){.app{display:block}nav{position:fixed;bottom:0;left:0;right:0;top:auto;height:auto;display:flex;padding:6px 6px calc(6px + env(safe-area-inset-bottom,0px));border:0;border-top:1px solid var(--line);z-index:8}
+nav .brand{display:none}nav button{text-align:center;padding:8px 2px;font-size:12px;margin:0;flex:1}nav button.on{box-shadow:inset 0 3px var(--g)}
+main{padding:16px 14px 90px}.grid{grid-template-columns:1fr}.hero .big{font-size:36px}}
+@media(prefers-reduced-motion:reduce){.wheel{transition:none}}
+</style>
+</head>
+<body class="out">
+<div id="auth"><div class="authbox">
+<div class="brand">Kwik<i>.</i>Rewards</div>
+<p class="note">Earn points on real orders and spend them as store credit.</p>
+<p class="err" id="cfg" hidden>Setup needed: add your Supabase URL and anon key near the end of this file. The SQL to run is at the top.</p>
+<div class="tabs"><button class="ghost on" type="button" data-at="in">Sign in</button><button class="ghost" type="button" data-at="up">Create account</button></div>
+<form id="fin" autocomplete="on">
+<label for="ie">Email</label><input id="ie" type="email" autocomplete="email" required>
+<label for="ip">Password</label><input id="ip" type="password" autocomplete="current-password" required>
+<p class="err" id="ierr" role="alert"></p><button type="submit">Sign in</button><button class="ghost" type="button" data-a="forgot" style="width:100%;margin-top:8px">Forgot password?</button></form>
+<form id="fup" hidden autocomplete="on">
+<label for="un">Full name</label><input id="un" autocomplete="name" required>
+<label for="ue">Email</label><input id="ue" type="email" autocomplete="email" required>
+<label for="up">Password (6+ characters)</label><input id="up" type="password" autocomplete="new-password" required>
+<label for="uc">Invite code (optional)</label><input id="uc" placeholder="e.g. AMIN-4K7">
+<p class="err" id="uerr" role="alert"></p><button type="submit">Create account</button></form>
+</div></div>
+<div class="app">
+<nav aria-label="Main">
+<div class="brand">Kwik<i>.</i>Rewards</div>
+<button data-t="home" class="on">Home</button><button data-t="tiers">Tiers</button><button data-t="refer">Invite</button><button data-t="wallet">Wallet</button><button data-t="settings">Settings</button>
+</nav>
+<main id="main"></main>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+var SUPABASE_URL="https://YOUR-PROJECT.supabase.co",SUPABASE_ANON_KEY="YOUR-ANON-KEY";
+var TIERS=[{n:"Bronze",min:0,perk:"1 spin a day, 1 pt per 1,000 XAF spent"},{n:"Silver",min:20000,perk:"1.5 pts per 1,000 XAF spent"},{n:"Gold",min:75000,perk:"Free delivery on Fridays, 2 pts per 1,000 XAF"},{n:"Platinum",min:200000,perk:"Early access to deals, 3 pts per 1,000 XAF"}];
+var sb=null,P=null,LOG=[],REFS=[],tab="home",angle=0,spinning=false,EMAIL="";
+if(!/YOUR-/.test(SUPABASE_URL)&&window.supabase)sb=supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
+function $(s){return document.querySelector(s)}
+function fmt(n){return Number(n).toLocaleString("en-US")}
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return"&#"+c.charCodeAt(0)+";"})}
+function toast(m){var t=$("#toast");t.textContent=m;t.className="toast show";setTimeout(function(){t.className="toast"},2800)}
+function day(o){var d=new Date();d.setUTCDate(d.getUTCDate()+(o||0));return d.toISOString().slice(0,10)}
+function tierIdx(){var i=0;TIERS.forEach(function(t,k){if(P.spent>=t.min)i=k});return i}
+function streak(){return(P.last_check===day()||P.last_check===day(-1))?P.streak:0}
+function row(l){return '<div class="row"><span>'+esc(l.note)+'</span><span class="'+(l.pts>=0?"pos":"neg")+'">'+(l.pts>=0?"+":"")+fmt(l.pts)+' pts</span></div>'}
+function home(){var ti=tierIdx(),nx=TIERS[ti+1],pct=nx?Math.min(100,(P.spent-TIERS[ti].min)/(nx.min-TIERS[ti].min)*100):100,st=streak(),done=P.last_check===day(),spun=P.last_spin===day(),d="";
+for(var i=1;i<=7;i++)d+='<div class="day'+(i<=st?" done":"")+'">Day '+i+'</div>';
+return '<div class="top"><div><h1>Hi, '+esc(P.name.split(" ")[0])+'</h1><p>'+TIERS[ti].n+' member</p></div></div>'+
+'<section class="panel hero"><div><small>Your points</small><div class="big">'+fmt(P.points)+'</div><small>1 point = 1 XAF in store credit</small></div><button data-a="wallet">Use points</button></section>'+
+'<div class="grid"><section class="panel"><h2>Daily check-in</h2><p class="note">Check in each day to build a streak. Day 7 pays 150 points.</p><div class="days">'+d+'</div><button data-a="check"'+(done?" disabled":"")+'>'+(done?"Checked in today":"Check in (+10 pts)")+'</button></section>'+
+'<section class="panel wheelbox"><h2>Daily spin</h2><div class="wheelwrap"><div class="pin"></div><div class="wheel" id="wheel" style="transform:rotate('+angle+'deg)"></div></div><button data-a="spin"'+(spun||spinning?" disabled":"")+'>'+(spun?"Come back tomorrow":"Spin")+'</button></section></div>'+
+'<section class="panel"><h2>Next tier</h2><p class="note">'+(nx?fmt(nx.min-P.spent)+" XAF more in orders to reach "+nx.n:"You are at the top tier")+'</p><div class="bar"><i style="width:'+pct+'%"></i></div></section>'+
+'<section class="panel"><h2>Recent activity</h2>'+(LOG.length?LOG.slice(0,5).map(row).join(""):'<p class="note">Nothing yet. Check in to earn your first points.</p>')+'</section>'}
+function tiers(){var ti=tierIdx();return '<div class="top"><div><h1>Tiers</h1><p>Tiers are based on what you spend in orders over time.</p></div></div><section class="panel">'+
+TIERS.map(function(t,i){return '<div class="tier'+(i==ti?" cur":"")+'"><b>'+t.n+'</b><span>'+t.perk+'<br>From '+fmt(t.min)+' XAF</span></div>'}).join("")+'</section>'}
+function refer(){return '<div class="top"><div><h1>Invite friends</h1><p>You and your friend each get 100 points after their first order is delivered.</p></div></div>'+
+'<section class="panel"><p class="note">Your code</p><span class="code">'+esc(P.code)+'</span> <button class="ghost" data-a="copy">Copy</button></section>'+
+'<section class="panel"><h2>Your invites</h2>'+(REFS.length?REFS.map(function(r){return '<div class="row"><span>'+esc(r.name)+'</span><span class="'+(r.ordered?"pos":"note")+'">'+(r.ordered?"First order placed":"Waiting for first order")+'</span></div>'}).join(""):'<p class="note">No one has used your code yet. Share it to get started.</p>')+'</section>'}
+function wallet(){return '<div class="top"><div><h1>Wallet</h1><p>Balance: '+fmt(P.points)+' pts ('+fmt(P.points)+' XAF)</p></div></div><div class="grid">'+
+'<section class="panel"><h2>Use as store credit</h2><p class="note">Applied at checkout on your next order.</p><label for="cr">Points to use</label><input id="cr" type="number" min="100" step="100" placeholder="e.g. 500"><p></p><button data-a="credit">Apply credit</button></section>'+
+'<section class="panel"><h2>Cash out to mobile money</h2><p class="note">Minimum 2,000 pts. Requests are checked and paid within 24 hours.</p><label for="mm">MTN MoMo or Orange Money number</label><input id="mm" inputmode="tel" placeholder="6XXXXXXXX"><label for="ca">Points to cash out</label><input id="ca" type="number" min="2000" step="100" placeholder="2000"><label for="wp">Withdrawal PIN</label><input id="wp" type="password" inputmode="numeric" maxlength="4"><p></p><button data-a="cash">Request cash out</button></section></div>'+
+'<section class="panel"><h2>History</h2>'+(LOG.length?LOG.slice(0,12).map(row).join(""):'<p class="note">No activity yet.</p>')+'</section>'}
+function settings(){return '<div class="top"><div><h1>Settings</h1></div></div><section class="panel"><h2>Withdrawal PIN</h2><p class="note">'+(P.has_pin?"PIN is set. Enter a new one to change it.":"Set a 4-digit PIN before you can cash out.")+'</p><label for="np">New PIN</label><input id="np" type="password" inputmode="numeric" maxlength="4"><p></p><button data-a="setpin">Save PIN</button></section>'+
+'<section class="panel"><h2>Account</h2><p class="note">Signed in as '+esc(EMAIL)+'</p><button class="ghost" data-a="logout">Log out</button></section>'+
+'<section class="panel"><h2>Theme</h2><button class="ghost" data-a="theme">Switch light / dark</button></section>'+
+'<section class="panel"><h2>Activity log</h2><div class="scroll">'+(LOG.length?LOG.map(row).join(""):'<p class="note">No activity yet.</p>')+'</div></section>'}
+var V={home:home,tiers:tiers,refer:refer,wallet:wallet,settings:settings};
+function render(){if(!P)return;$("#main").innerHTML=V[tab]();document.querySelectorAll("nav button").forEach(function(b){b.classList.toggle("on",b.dataset.t==tab)})}
+function go(t){tab=t;render();window.scrollTo(0,0)}
+async function refresh(){var a=await sb.from("profiles").select("name,code,points,spent,streak,last_check,last_spin,has_pin").single();
+if(a.error){toast("Could not load your profile: "+a.error.message);return false}
+P=a.data;var l=await sb.from("ledger").select("note,pts").order("id",{ascending:false}).limit(30);LOG=l.data||[];
+var f=await sb.rpc("my_referrals");REFS=f.data||[];render();return true}
+async function enter(u){EMAIL=u.email;tab="home";if(await refresh()){document.body.className="in";window.scrollTo(0,0)}}
+function leave(){P=null;LOG=[];REFS=[];EMAIL="";document.body.className="out";$("#fin").reset();$("#fup").reset()}
+async function call(fn,args,ok){var r=await sb.rpc(fn,args);if(r.error){toast(r.error.message);return null}if(r.data&&r.data.error){toast(r.data.error);return null}if(ok)toast(ok);await refresh();return r}
+async function spin(){if(spinning)return;var r=await sb.rpc("spin");if(r.error)return toast(r.error.message);
+var i=r.data.i;spinning=true;$("[data-a=spin]").disabled=true;angle=angle+1800+(360-(i*60+30))-(angle%360);$("#wheel").style.transform="rotate("+angle+"deg)";
+setTimeout(async function(){spinning=false;toast(r.data.pts?"You won "+r.data.label:r.data.label);await refresh()},3300)}
+document.addEventListener("click",async function(e){var b=e.target.closest("button");if(!b)return;
+if(b.dataset.t)return go(b.dataset.t);var a=b.dataset.a;if(!a)return;
+if(a=="theme"){var r=document.documentElement,d=r.dataset.theme=="dark"||(!r.dataset.theme&&matchMedia("(prefers-color-scheme:dark)").matches);r.dataset.theme=d?"light":"dark";return}
+if(a=="forgot"){var em=$("#ie").value.trim();if(!sb)return $("#ierr").textContent="Add your Supabase URL and key first.";if(!em)return $("#ierr").textContent="Enter your email above first.";
+var fr=await sb.auth.resetPasswordForEmail(em,{redirectTo:location.href.split("#")[0]});$("#ierr").textContent=fr.error?fr.error.message:"Password reset link sent. Check your email.";return}
+if(!sb||!P)return;
+if(a=="wallet")go("wallet");
+else if(a=="check")await call("check_in",undefined,"Checked in");
+else if(a=="spin")await spin();
+else if(a=="copy"){try{await navigator.clipboard.writeText(P.code)}catch(x){}toast("Code copied")}
+else if(a=="credit"){var n=parseInt($("#cr").value,10);if(!n)return toast("Enter the points to use");await call("redeem_credit",{p_n:n},fmt(n)+" XAF credit ready for checkout")}
+else if(a=="cash"){var n2=parseInt($("#ca").value,10);if(!n2)return toast("Enter the points to cash out");await call("request_cashout",{p_phone:$("#mm").value.replace(/\s/g,""),p_pin:$("#wp").value,p_n:n2},"Request sent. Payouts take up to 24 hours.")}
+else if(a=="setpin")await call("set_pin",{p_pin:$("#np").value},"PIN saved");
+else if(a=="logout")await sb.auth.signOut();
+});
+document.querySelectorAll("[data-at]").forEach(function(b){b.addEventListener("click",function(){var up=b.dataset.at=="up";$("#fin").hidden=up;$("#fup").hidden=!up;
+document.querySelectorAll("[data-at]").forEach(function(x){x.classList.toggle("on",x===b)});$("#ierr").textContent="";$("#uerr").textContent=""})});
+$("#fup").addEventListener("submit",async function(e){e.preventDefault();var er=$("#uerr"),n=$("#un").value.trim(),pw=$("#up").value;
+if(!sb)return er.textContent="Add your Supabase URL and key first.";if(n.length<2)return er.textContent="Enter your full name.";if(pw.length<6)return er.textContent="Password must be at least 6 characters.";
+var r=await sb.auth.signUp({email:$("#ue").value.trim().toLowerCase(),password:pw,options:{data:{name:n,ref:$("#uc").value.trim()}}});
+if(r.error)return er.textContent=r.error.message;
+if(!r.data.session)return er.textContent="Check your email to confirm your account, then sign in.";
+await enter(r.data.user);toast("Welcome, "+n.split(" ")[0])});
+$("#fin").addEventListener("submit",async function(e){e.preventDefault();var er=$("#ierr");
+if(!sb)return er.textContent="Add your Supabase URL and key first.";
+var r=await sb.auth.signInWithPassword({email:$("#ie").value.trim().toLowerCase(),password:$("#ip").value});
+if(r.error)return er.textContent=r.error.message;await enter(r.data.user)});
+(async function(){if(!sb){$("#cfg").hidden=false;return}
+sb.auth.onAuthStateChange(function(ev){if(ev=="SIGNED_OUT")leave();if(ev=="PASSWORD_RECOVERY")setTimeout(async function(){var np=prompt("Enter a new password (6+ characters)");if(np&&np.length>=6){var u=await sb.auth.updateUser({password:np});toast(u.error?u.error.message:"Password updated")}},100)});
+var s=await sb.auth.getSession();if(s.data.session)await enter(s.data.session.user)})();
+</script>
+</body>
+</html>
